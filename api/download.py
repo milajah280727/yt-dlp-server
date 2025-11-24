@@ -8,7 +8,7 @@ from pathlib import Path
 
 app = FastAPI(title="yt-dlp Server 2025 - Anti Bot Check + Headers")
 
-# Path cookies (opsional, tetap bisa jalan tanpa cookies)
+# Path cookies (opsional — bisa jalan tanpa ini)
 COOKIE_PATH = "cookies/cookies.txt" if os.path.exists("cookies/cookies.txt") else None
 
 @app.get("/")
@@ -53,7 +53,7 @@ async def download_video(
     temp_dir = Path("/tmp") / video_id
     temp_dir.mkdir(exist_ok=True)
 
-    # Format super aman: coba 1080p + audio → fallback 720p muxed → worst
+    # Format pintar: Coba 1080p + audio → fallback 720p muxed → worst (anti-bot)
     format_selector = f'best[height<={q}]+bestaudio/best[height<={q}]/best[height<=720]/best'
 
     ydl_opts = {
@@ -67,7 +67,7 @@ async def download_video(
         'fragment_retries': 15,
         'sleep_interval': 1,
         'max_sleep_interval': 5,
-        # HEADERS ANTI-BOT PALING KUAT 2025
+        # HEADERS ANTI-BOT YANG KAMU MAU (SIMULASI BROWSER ASLI)
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://www.youtube.com/',
@@ -76,6 +76,9 @@ async def download_video(
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
         },
     }
 
@@ -83,16 +86,16 @@ async def download_video(
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        # Cari file MP4 yang sudah jadi
-        mp4_file = next((f for f in temp_dir.iterdir() if f.suffix in {".mp4", ".mkv", ".webm"}), None)
-        if not mp4_file:
+        # Cari file video (MP4 atau fallback)
+        video_file = next((f for f in temp_dir.iterdir() if f.suffix in {".mp4", ".mkv", ".webm"}), None)
+        if not video_file:
             return JSONResponse({"error": "File video tidak ditemukan setelah download"}, status_code=500)
 
         title = (info.get("title") or "video")[:120]
         safe_title = "".join(c for c in title if c.isalnum() or c in " -_").rstrip()
 
         def file_stream():
-            with open(mp4_file, "rb") as f:
+            with open(video_file, "rb") as f:
                 yield from f
             asyncio.create_task(cleanup_temp(temp_dir))
 
@@ -110,7 +113,7 @@ async def download_video(
         error_msg = str(e)
         if "Sign in" in error_msg or "bot" in error_msg.lower():
             return JSONResponse({
-                "error": "YouTube blokir sementara. Coba video lain atau tambah cookies.txt untuk 100% bypass!"
+                "error": "YouTube blokir sementara. Coba lagi 5 menit kemudian atau video lain. Headers sudah dioptimasi!"
             }, status_code=403)
         return JSONResponse({"error": error_msg}, status_code=500)
 
