@@ -8,29 +8,38 @@ from pathlib import Path
 
 app = FastAPI()
 
-# BACA COOKIES DARI ENVIRONMENT VARIABLE (Vercel)
+# AMBIL COOKIES DARI ENV & TULIS DENGAN UTF-8 (INI YANG FIX ERROR UNICODE!)
 cookie_txt = os.getenv("YOUTUBE_COOKIES", "")
 COOKIE_PATH = None
 if cookie_txt.strip():
     COOKIE_PATH = "/tmp/cookies.txt"
-    with open(COOKIE_PATH, "w", encoding="utf-8") as f:
-        f.write(cookie_txt.strip())
+    try:
+        # PAKAI UTF-8 + ignore error kalau ada karakter aneh
+        with open(COOKIE_PATH, "w", encoding="utf-8", errors="ignore") as f:
+            f.write(cookie_txt.strip() + "\n")
+    except Exception as e:
+        print("Cookie write error:", e)
+        COOKIE_PATH = None
 
 @app.get("/")
 async def home():
-    return {"message": "Server yt-dlp aktif!", "cookies": "loaded" if COOKIE_PATH else "none"}
+    return {"message": "Server aktif!", "cookies": "loaded" if COOKIE_PATH else "none"}
 
 @app.get("/info")
 async def get_info(url: str = Query(...)):
-    ydl_opts = {'quiet': True, 'cookiefile': COOKIE_PATH}
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+    }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         return {
-            "title": info.get("title"),
-            "author": info.get("uploader"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail") or (info.get("thumbnails", [{}])[-1].get("url") if info.get("thumbnails") else None),
+            "title": info.get("title", "Unknown"),
+            "author": info.get("uploader", "Unknown"),
+            "duration": info.get("duration", 0),
+            "thumbnail": info.get("thumbnail") or (info.get("thumbnails")[-1]["url"] if info.get("thumbnails") else None),
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -46,29 +55,32 @@ async def download_video(url: str = Query(...), q: str = Query("1080")):
         'merge_output_format': 'mp4',
         'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
         'quiet': True,
-        'cookiefile': COOKIE_PATH,   # INI YANG BIKIN BISA BYPASS BOT!
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+        'retries': 3,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        video_file = next((f for f in temp_dir.iterdir() if f.suffix in {".mp4", ".mkv", ".webm"}), None)
+        video_file = next((f for f in temp_dir.iterdir() if f.suffix in {".mp4", ".webm", ".mkv"}), None)
         if not video_file:
-            return JSONResponse({"error": "File tidak ditemukan"}, status_code=500)
+            return JSONResponse({"error": "Video tidak ditemukan"}, status_code=500)
 
-        title = "".join(c for c in (info.get("title") or "video") if c.isalnum() or c in " -_")[:100]
+        safe_title = "".join(c if ord(c) < 128 else "_" for c in (info.get("title") or "video")[:100])
 
-        def streamer():
+        def stream_file():
             with open(video_file, "rb") as f:
                 yield from f
             asyncio.create_task(cleanup(temp_dir))
 
         return StreamingResponse(
-            streamer(),
+            stream_file(),
             media_type="video/mp4",
-            headers={"Content-Disposition": f'attachment; filename="{title}.mp4"'}
+            headers={"Content-Disposition": f'attachment; filename="{safe_title}.mp4"'}
         )
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
