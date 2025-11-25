@@ -8,12 +8,13 @@ from pathlib import Path
 
 app = FastAPI()
 
-# Cookies untuk video private / age-restricted (opsional)
+# AMBIL COOKIES DARI ENV & TULIS DENGAN UTF-8 (INI YANG FIX ERROR UNICODE!)
 cookie_txt = os.getenv("YOUTUBE_COOKIES", "")
 COOKIE_PATH = None
 if cookie_txt.strip():
     COOKIE_PATH = "/tmp/cookies.txt"
     try:
+        # PAKAI UTF-8 + ignore error kalau ada karakter aneh
         with open(COOKIE_PATH, "w", encoding="utf-8", errors="ignore") as f:
             f.write(cookie_txt.strip() + "\n")
     except Exception as e:
@@ -22,16 +23,15 @@ if cookie_txt.strip():
 
 @app.get("/")
 async def home():
-    return {
-        "message": "YT Server Aktif!",
-        "audio": "M4A (tanpa FFmpeg - 100% work di Vercel)",
-        "cookies": "loaded" if COOKIE_PATH else "none"
-    }
+    return {"message": "Server aktif!", "cookies": "loaded" if COOKIE_PATH else "none"}
 
-# INFO VIDEO
 @app.get("/info")
 async def get_info(url: str = Query(...)):
-    ydl_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': COOKIE_PATH}
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+    }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -39,149 +39,102 @@ async def get_info(url: str = Query(...)):
             "title": info.get("title", "Unknown"),
             "author": info.get("uploader", "Unknown"),
             "duration": info.get("duration", 0),
-            "thumbnail": info.get("thumbnail") or (info.get("thumbnails", [{}])[-1].get("url")),
+            "thumbnail": info.get("thumbnail") or (info.get("thumbnails")[-1]["url"] if info.get("thumbnails") else None),
         }
     except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-# DOWNLOAD VIDEO (720p, 1080p, dll)
 @app.get("/download")
-async def download_video(url: str = Query(...), quality: str = Query("720")):
-    temp_dir = Path("/tmp") / str(uuid.uuid4())[:8]
+async def download_video(url: str = Query(...), quality: str = Query("1080")):
+    video_id = str(uuid.uuid4())[:8]
+    temp_dir = Path("/tmp") / video_id
     temp_dir.mkdir(exist_ok=True)
 
     ydl_opts = {
-        'format': f'best[height<={quality}]+bestaudio/best',
+        'format': f'best[height<={quality}]+bestaudio/best[height<={quality}]/best',
         'merge_output_format': 'mp4',
         'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
         'cookiefile': COOKIE_PATH,
-        'noplaylist': True,
+        'retries': 3,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        # Tunggu file muncul
-        video_file = None
-        for _ in range(60):
-            await asyncio.sleep(0.2)
-            video_file = next((f for f in temp_dir.iterdir() if f.suffix == ".mp4"), None)
-            if video_file and video_file.stat().st_size > 10000:
-                break
-
+        video_file = next((f for f in temp_dir.iterdir() if f.suffix in {".mp4", ".webm", ".mkv"}), None)
         if not video_file:
-            return JSONResponse({"error": "Video gagal diproses"}, 500)
+            return JSONResponse({"error": "Video tidak ditemukan"}, status_code=500)
 
         safe_title = "".join(c if ord(c) < 128 else "_" for c in (info.get("title") or "video")[:100])
 
-        def stream():
+        def stream_file():
             with open(video_file, "rb") as f:
                 yield from f
             asyncio.create_task(cleanup(temp_dir))
 
         return StreamingResponse(
-            stream(),
+            stream_file(),
             media_type="video/mp4",
             headers={"Content-Disposition": f'attachment; filename="{safe_title}.mp4"'}
         )
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
 
-# DOWNLOAD AUDIO — TANPA FFMPEG! (PAKAI .m4a ASLI YOUTUBE — KUALITAS TERBAIK!)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 @app.get("/download-audio")
-async def download_audio(url: str = Query(...)):
-    temp_dir = Path("/tmp") / str(uuid.uuid4())[:8]
+async def download_audio(url: str = Query(...), quality: str = Query("best")):
+    video_id = str(uuid.uuid4())[:8]
+    temp_dir = Path("/tmp") / video_id
     temp_dir.mkdir(exist_ok=True)
 
+    # Set format based on quality parameter
+    if quality == "best":
+        format_selector = 'bestaudio/best'
+    else:
+        # Convert kbps to approximate format
+        format_selector = f'bestaudio[abr<={quality}]/bestaudio'
+
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',  # Prioritas .m4a (kualitas 129-160kbps)
+        'format': format_selector,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': quality if quality != "best" else '0',  # 0 means best quality
+        }],
         'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
         'cookiefile': COOKIE_PATH,
-        'noplaylist': True,
+        'retries': 3,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        # Tunggu file audio muncul
-        audio_file = None
-        for _ in range(60):
-            await asyncio.sleep(0.2)
-            audio_file = next((f for f in temp_dir.iterdir() if f.suffix in {".m4a", ".webm"}), None)
-            if audio_file and audio_file.stat().st_size > 50000:  # minimal 50KB
-                break
-
+        # Look for the converted MP3 file
+        audio_file = next((f for f in temp_dir.iterdir() if f.suffix == ".mp3"), None)
         if not audio_file:
-            return JSONResponse({"error": "Audio tidak ditemukan (timeout)"}, 500)
+            return JSONResponse({"error": "Audio tidak ditemukan"}, status_code=500)
 
         safe_title = "".join(c if ord(c) < 128 else "_" for c in (info.get("title") or "audio")[:100])
-        ext = audio_file.suffix
 
-        def stream():
+        def stream_file():
             with open(audio_file, "rb") as f:
                 yield from f
             asyncio.create_task(cleanup(temp_dir))
 
         return StreamingResponse(
-            stream(),
-            media_type="audio/mp4" if ext == ".m4a" else "audio/webm",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}{ext}"'}
+            stream_file(),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": f'attachment; filename="{safe_title}.mp3"'}
         )
+
     except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
-
-# STREAMING LANGSUNG (untuk Flutter)
-@app.get("/stream")
-async def stream_video(url: str = Query(...), quality: str = Query("720")):
-    temp_dir = Path("/tmp") / str(uuid.uuid4())[:8]
-    temp_dir.mkdir(exist_ok=True)
-
-    ydl_opts = {
-        'format': f'best[height<={quality}]+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'outtmpl': str(temp_dir / 'stream.mp4'),
-        'quiet': True,
-        'cookiefile': COOKIE_PATH,
-        'noplaylist': True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
-
-        file = None
-        for _ in range(80):
-            await asyncio.sleep(0.2)
-            file = temp_dir / "stream.mp4"
-            if file.exists() and file.stat().st_size > 100000:
-                break
-
-        if not file or not file.exists():
-            return JSONResponse({"error": "Stream tidak siap"}, 500)
-
-        def stream():
-            with open(file, "rb") as f:
-                while chunk := f.read(1024*1024):
-                    yield chunk
-            asyncio.create_task(cleanup(temp_dir))
-
-        return StreamingResponse(
-            stream(),
-            media_type="video/mp4",
-            headers={
-                "Accept-Ranges": "bytes",
-                "Content-Disposition": "inline",
-                "Cache-Control": "public, max-age=3600"
-            }
-        )
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 async def cleanup(directory: Path):
     await asyncio.sleep(600)
