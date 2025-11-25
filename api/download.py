@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
 import os
 import uuid
@@ -8,168 +8,139 @@ from pathlib import Path
 
 app = FastAPI()
 
-# Optional: Cookies untuk video private / age-restricted
+# AMBIL COOKIES DARI ENV & TULIS DENGAN UTF-8 (INI YANG FIX ERROR UNICODE!)
 cookie_txt = os.getenv("YOUTUBE_COOKIES", "")
-COOKIE_PATH = "/tmp/cookies.txt" if cookie_txt.strip() else None
-if COOKIE_PATH:
+COOKIE_PATH = None
+if cookie_txt.strip():
+    COOKIE_PATH = "/tmp/cookies.txt"
     try:
+        # PAKAI UTF-8 + ignore error kalau ada karakter aneh
         with open(COOKIE_PATH, "w", encoding="utf-8", errors="ignore") as f:
             f.write(cookie_txt.strip() + "\n")
-    except:
+    except Exception as e:
+        print("Cookie write error:", e)
         COOKIE_PATH = None
-
-def get_ydl_opts(extra=None):
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'retries': 5,
-    }
-    if COOKIE_PATH:
-        opts['cookiefile'] = COOKIE_PATH
-    if extra:
-        opts.update(extra)
-    return opts
-
-async def wait_for_file(temp_dir: Path, pattern: str, timeout=30):
-    for _ in range(int(timeout / 0.2)):
-        await asyncio.sleep(0.2)
-        files = list(temp_dir.iterdir())
-        match = next((f for f in files if pattern in f.name.lower()), None)
-        if match and match.stat().st_size > 1000:
-            return match
-    return None
 
 @app.get("/")
 async def home():
-    return {"message": "YT Downloader API Ready!", "author": "reebza"}
+    return {"message": "Server aktif!", "cookies": "loaded" if COOKIE_PATH else "none"}
 
 @app.get("/info")
-async def info(url: str = Query(...)):
+async def get_info(url: str = Query(...)):
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+    }
     try:
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         return {
             "title": info.get("title", "Unknown"),
-            "uploader": info.get("uploader", "Unknown"),
+            "author": info.get("uploader", "Unknown"),
             "duration": info.get("duration", 0),
-            "thumbnail": info.get("thumbnail"),
-            "id": info.get("id")
+            "thumbnail": info.get("thumbnail") or (info.get("thumbnails")[-1]["url"] if info.get("thumbnails") else None),
         }
     except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-@app.get("/resolutions")
-async def resolutions(url: str = Query(...)):
-    try:
-        with yt_dlp.YoutubeDL(get_ydl_opts({'format': 'best'})) as ydl:
-            info = ydl.extract_info(url, download=False)
-        formats = info.get("formats", [])
-        heights = sorted({f['height'] for f in formats if f.get('height')}, reverse=True)
-        return {"available": [h for h in heights if h]}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
-
-@app.get("/download/video")
-async def download_video(url: str = Query(...), height: int = Query(720)):
-    temp_dir = Path("/tmp") / str(uuid.uuid4())[:8]
+@app.get("/download")
+async def download_video(url: str = Query(...), quality: str = Query("1080")):
+    video_id = str(uuid.uuid4())[:8]
+    temp_dir = Path("/tmp") / video_id
     temp_dir.mkdir(exist_ok=True)
 
-    ydl_opts = get_ydl_opts({
-        'format': f'best[height<={height}]+bestaudio/best',
+    ydl_opts = {
+        'format': f'best[height<={quality}]+bestaudio/best[height<={quality}]/best',
         'merge_output_format': 'mp4',
         'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
-    })
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+        'retries': 3,
+    }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        file = await wait_for_file(temp_dir, ".mp4")
-        if not file:
-            return JSONResponse({"error": "Video tidak tersedia"}, 500)
+        video_file = next((f for f in temp_dir.iterdir() if f.suffix in {".mp4", ".webm", ".mkv"}), None)
+        if not video_file:
+            return JSONResponse({"error": "Video tidak ditemukan"}, status_code=500)
 
-        safe_title = "".join(c if ord(c) < 128 else "_" for c in info.get("title", "video")[:100])
+        safe_title = "".join(c if ord(c) < 128 else "_" for c in (info.get("title") or "video")[:100])
 
-        def streamer():
-            with open(file, "rb") as f:
+        def stream_file():
+            with open(video_file, "rb") as f:
                 yield from f
-            asyncio.create_task(asyncio.to_thread(lambda: [f.unlink() for f in temp_dir.iterdir()] + [temp_dir.rmdir()]))
+            asyncio.create_task(cleanup(temp_dir))
 
         return StreamingResponse(
-            streamer(),
+            stream_file(),
             media_type="video/mp4",
             headers={"Content-Disposition": f'attachment; filename="{safe_title}.mp4"'}
         )
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
 
-@app.get("/download/audio")
-async def download_audio(url: str = Query(...)):
-    temp_dir = Path("/tmp") / str(uuid.uuid4())[:8]
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/download-audio")
+async def download_audio(url: str = Query(...), quality: str = Query("best")):
+    video_id = str(uuid.uuid4())[:8]
+    temp_dir = Path("/tmp") / video_id
     temp_dir.mkdir(exist_ok=True)
 
-    ydl_opts = get_ydl_opts({
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+    # Set format based on quality parameter
+    if quality == "best":
+        format_selector = 'bestaudio/best'
+    else:
+        # Convert kbps to approximate format
+        format_selector = f'bestaudio[abr<={quality}]/bestaudio'
+
+    ydl_opts = {
+        'format': format_selector,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': quality if quality != "best" else '0',  # 0 means best quality
+        }],
         'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
-    })
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+        'retries': 3,
+    }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        file = await wait_for_file(temp_dir, ".m4a")
-        if not file:
-            return JSONResponse({"error": "Audio tidak tersedia"}, 500)
+        # Look for the converted MP3 file
+        audio_file = next((f for f in temp_dir.iterdir() if f.suffix == ".mp3"), None)
+        if not audio_file:
+            return JSONResponse({"error": "Audio tidak ditemukan"}, status_code=500)
 
-        safe_title = "".join(c if ord(c) < 128 else "_" for c in info.get("title", "audio")[:100])
+        safe_title = "".join(c if ord(c) < 128 else "_" for c in (info.get("title") or "audio")[:100])
 
-        def streamer():
-            with open(file, "rb") as f:
+        def stream_file():
+            with open(audio_file, "rb") as f:
                 yield from f
-            asyncio.create_task(asyncio.to_thread(lambda: [f.unlink() for f in temp_dir.iterdir()] + [temp_dir.rmdir()]))
+            asyncio.create_task(cleanup(temp_dir))
 
         return StreamingResponse(
-            streamer(),
-            media_type="audio/mp4",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}.m4a"'}
+            stream_file(),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": f'attachment; filename="{safe_title}.mp3"'}
         )
+
     except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-@app.get("/stream/video")
-async def stream_video(url: str = Query(...), height: int = Query(720)):
-    temp_dir = Path("/tmp") / str(uuid.uuid4())[:8]
-    temp_dir.mkdir(exist_ok=True)
-
-    ydl_opts = get_ydl_opts({
-        'format': f'best[height<={height}]+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'outtmpl': str(temp_dir / 'stream.mp4'),
-    })
-
+async def cleanup(directory: Path):
+    await asyncio.sleep(600)
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
-
-        file = await wait_for_file(temp_dir, "stream.mp4", timeout=40)
-        if not file:
-            return JSONResponse({"error": "Stream tidak siap"}, 500)
-
-        def streamer():
-            with open(file, "rb") as f:
-                while chunk := f.read(1024*1024):
-                    yield chunk
-            asyncio.create_task(asyncio.to_thread(lambda: [f.unlink() for f in temp_dir.iterdir()] + [temp_dir.rmdir()]))
-
-        return StreamingResponse(
-            streamer(),
-            media_type="video/mp4",
-            headers={
-                "Accept-Ranges": "bytes",
-                "Content-Disposition": "inline",
-                "Cache-Control": "public, max-age=3600"
-            }
-        )
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
+        for f in directory.iterdir():
+            f.unlink()
+        directory.rmdir()
+    except:
+        pass
