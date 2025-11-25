@@ -95,22 +95,29 @@ async def download_audio(url: str = Query(...)):
     temp_dir.mkdir(exist_ok=True)
 
     ydl_opts = {
-        'format': 'bestaudio/best',  # YouTube kasih .m4a atau .webm terbaik
+        'format': 'bestaudio/best',
         'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
         'cookiefile': COOKIE_PATH,
         'retries': 3,
+        'noplaylist': True,          # INI YANG BIKIN AMAN DARI PLAYLIST
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        # Cari file audio (biasanya .m4a, kadang .webm)
-        audio_file = next((f for f in temp_dir.iterdir() if f.suffix in {".m4a", ".webm", ".opus"}), None)
+        # Cari file audio
+        audio_file = None
+        for _ in range(30):  # tunggu max 6 detik
+            audio_file = next((f for f in temp_dir.iterdir() if f.suffix in {".m4a", ".webm", ".opus"}), None)
+            if audio_file:
+                break
+            await asyncio.sleep(0.2)
+
         if not audio_file:
-            return JSONResponse({"error": "Audio tidak ditemukan"}, status_code=500)
+            return JSONResponse({"error": "Audio tidak ditemukan (mungkin karena playlist)"}, status_code=500)
 
         safe_title = "".join(c if ord(c) < 128 else "_" for c in (info.get("title") or "audio")[:100])
         ext = audio_file.suffix
@@ -127,7 +134,7 @@ async def download_audio(url: str = Query(...)):
         )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
+    
 # === STREAMING LANGSUNG DI BROWSER (Video/Audio) ===
 @app.get("/stream")
 async def stream_media(url: str = Query(...), type: str = Query("video"), quality: str = Query("720")):
