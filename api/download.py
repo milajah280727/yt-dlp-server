@@ -10,8 +10,8 @@ from pathlib import Path
 
 app = FastAPI(
     title="YouTube Downloader API",
-    description="API untuk mengunduh, streaming, dan mencari video dari YouTube.",
-    version="4.0" # Versi baru
+    description="API untuk mengunduh video/audio (via yt-dlp) dan mendapatkan info.",
+    version="4.1" # Versi baru
 )
 
 # AMBIL COOKIES DARI ENV & TULIS DENGAN UTF-8
@@ -26,7 +26,7 @@ if cookie_txt.strip():
         print("Cookie write error:", e)
         COOKIE_PATH = None
 
-# --- Endpoint yang sudah ada (tidak berubah) ---
+# --- Endpoint yang Digunakan ---
 @app.get("/")
 async def home():
     return {"message": "Server aktif!", "cookies": "loaded" if COOKIE_PATH else "none"}
@@ -169,70 +169,7 @@ async def search_videos(q: str = Query(..., description="Kata kunci pencarian"),
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# --- Endpoint Streaming yang Telah DIPERBAIKI (Metode Download Lalu Stream) ---
-@app.get("/stream")
-async def stream_video(url: str = Query(...), quality: str = Query("1080")):
-    """
-    Streaming video dengan cara mengunduhnya terlebih dahulu ke server.
-    Metode ini lebih lambat untuk memulai, tetapi lebih andal di lingkungan Vercel.
-    """
-    print(f"--- STREAM REQUEST (DOWNLOAD-THEN-STREAM) ---")
-    print(f"URL: {url}, Quality: {quality}")
-
-    video_id = str(uuid.uuid4())[:8]
-    temp_dir = Path("/tmp") / video_id
-    temp_dir.mkdir(exist_ok=True)
-
-    ydl_opts = {
-        'format': f'best[height<={quality}]+bestaudio/best[height<={quality}]/best',
-        'merge_output_format': 'mp4',
-        'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
-        'cookiefile': COOKIE_PATH,
-        'retries': 3,
-    }
-
-    try:
-        print("Step 1: Downloading video with yt-dlp...")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-        
-        print("Step 1 Success: Video downloaded.")
-
-        video_file = next((f for f in temp_dir.iterdir() if f.suffix in {".mp4", ".webm", ".mkv"}), None)
-        if not video_file:
-            print("Step 1 Failed: Video file not found after download.")
-            return JSONResponse({"error": "Video tidak ditemukan setelah unduh"}, status_code=500)
-
-        safe_title = "".join(c if ord(c) < 128 else "_" for c in (info.get("title") or "video")[:100])
-
-        def iterfile():
-            print("Step 2: Starting to stream the downloaded file...")
-            with open(video_file, "rb") as f:
-                yield from f
-            # Cleanup dijalankan setelah streaming selesai
-            print("Step 3: Scheduling cleanup...")
-            asyncio.create_task(cleanup(temp_dir))
-
-        # PERBEDAAN UTAMA: Gunakan header 'inline' untuk streaming
-        return StreamingResponse(
-            iterfile(),
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'inline; filename="{safe_title}.mp4"',
-                "Accept-Ranges": "bytes" # Penting untuk seeker (mundur/maju)
-            }
-        )
-
-    except Exception as e:
-        print(f"!!! STREAMING ERROR !!!")
-        print(f"Error: {e}")
-        # Jika terjadi error, coba bersihkan direktori
-        asyncio.create_task(cleanup(temp_dir))
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
+# --- Helper Function untuk Cleanup ---
 async def cleanup(directory: Path):
     await asyncio.sleep(600) # Tunggu 10 menit
     try:
