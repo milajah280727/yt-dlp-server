@@ -7,12 +7,11 @@ import os
 import uuid
 import asyncio
 from pathlib import Path
-import traceback  # Impor traceback untuk mendapatkan detail error
 
 app = FastAPI(
     title="YouTube Downloader API",
-    description="API untuk mengunduh, streaming (via FFmpeg), dan mencari video dari YouTube.",
-    version="3.2" # Versi baru
+    description="API untuk mengunduh, streaming, dan mencari video dari YouTube.",
+    version="4.0" # Versi baru
 )
 
 # AMBIL COOKIES DARI ENV & TULIS DENGAN UTF-8
@@ -170,122 +169,72 @@ async def search_videos(q: str = Query(..., description="Kata kunci pencarian"),
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# --- Endpoint Streaming yang Telah Diperbaiki dengan Path Lengkap ---
+# --- Endpoint Streaming yang Telah DIPERBAIKI (Metode Download Lalu Stream) ---
 @app.get("/stream")
 async def stream_video(url: str = Query(...), quality: str = Query("1080")):
     """
-    Streaming video secara langsung menggunakan FFmpeg tanpa mengunduh file ke server.
+    Streaming video dengan cara mengunduhnya terlebih dahulu ke server.
+    Metode ini lebih lambat untuk memulai, tetapi lebih andal di lingkungan Vercel.
     """
-    print(f"--- STREAM REQUEST RECEIVED ---")
+    print(f"--- STREAM REQUEST (DOWNLOAD-THEN-STREAM) ---")
     print(f"URL: {url}, Quality: {quality}")
 
-    # PERBAIKAN: Gunakan path lengkap ke FFmpeg di Vercel
-    ffmpeg_path = "/opt/vercel/bin/ffmpeg"
+    video_id = str(uuid.uuid4())[:8]
+    temp_dir = Path("/tmp") / video_id
+    temp_dir.mkdir(exist_ok=True)
 
-    # Coba dapatkan URL streaming
+    ydl_opts = {
+        'format': f'best[height<={quality}]+bestaudio/best[height<={quality}]/best',
+        'merge_output_format': 'mp4',
+        'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+        'retries': 3,
+    }
+
     try:
-        print("Step 1: Getting video URL with yt-dlp...")
-        ydl_opts = {
-            'format': f'best[height<={quality}]+bestaudio/best[height<={quality}]/best',
-            'quiet': True,
-            'no_warnings': True,
-            'cookiefile': COOKIE_PATH,
-        }
+        print("Step 1: Downloading video with yt-dlp...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            video_url = info.get('url')
+            info = ydl.extract_info(url, download=True)
+        
+        print("Step 1 Success: Video downloaded.")
 
-        if not video_url:
-            print("Step 1 Failed: yt-dlp did not return a direct URL. Trying fallback...")
-            # Fallback: Coba format tunggal terbaik yang sudah termasuk audio
-            ydl_fallback_opts = {
-                'format': f'best[height<={quality}][vcodec!=none][acodec!=none]/best[height<={quality}]/best',
-                'quiet': True,
-                'no_warnings': True,
-                'cookiefile': COOKIE_PATH,
-            }
-            with yt_dlp.YoutubeDL(ydl_fallback_opts) as ydl_fallback:
-                info_fallback = ydl_fallback.extract_info(url, download=False)
-                video_url = info_fallback.get('url')
+        video_file = next((f for f in temp_dir.iterdir() if f.suffix in {".mp4", ".webm", ".mkv"}), None)
+        if not video_file:
+            print("Step 1 Failed: Video file not found after download.")
+            return JSONResponse({"error": "Video tidak ditemukan setelah unduh"}, status_code=500)
 
-        if not video_url:
-            print("Step 1 Failed: Could not get a valid streaming URL from yt-dlp.")
-            return JSONResponse({"error": "Tidak bisa mendapatkan URL streaming yang cocok."}, status_code=500)
+        safe_title = "".join(c if ord(c) < 128 else "_" for c in (info.get("title") or "video")[:100])
 
-        print(f"Step 1 Success: Got video URL -> {video_url[:100]}...")
+        def iterfile():
+            print("Step 2: Starting to stream the downloaded file...")
+            with open(video_file, "rb") as f:
+                yield from f
+            # Cleanup dijalankan setelah streaming selesai
+            print("Step 3: Scheduling cleanup...")
+            asyncio.create_task(cleanup(temp_dir))
 
-    except Exception as e:
-        print(f"Step 1 Failed with an exception: {e}")
-        print(traceback.format_exc())  # Cetak seluruh detail error
-        return JSONResponse({"error": f"Gagal mendapatkan URL video: {str(e)}"}, status_code=500)
-
-    # Coba jalankan FFmpeg
-    try:
-        print("Step 2: Preparing FFmpeg command...")
-        command = [
-            ffmpeg_path,
-            '-i', video_url,
-            '-c', 'copy',  # Salin codec tanpa re-encoding
-            '-f', 'mp4',
-            '-movflags', 'frag_keyframe+empty_moov',
-            'pipe:1'  # Output ke stdout
-        ]
-        print(f"Step 2 Success: FFmpeg command -> {' '.join(command)}")
-
-        print("Step 3: Starting FFmpeg subprocess...")
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        print("Step 3 Success: FFmpeg subprocess started.")
-
-        async def generate():
-            try:
-                print("Step 4: Starting to read from FFmpeg stdout...")
-                while True:
-                    chunk = await process.stdout.read(8192)
-                    if not chunk:
-                        print("Step 4: FFmpeg stream finished.")
-                        break
-                    yield chunk
-            except Exception as e:
-                print(f"Step 4 Error while reading stream: {e}")
-                print(traceback.format_exc())
-            finally:
-                print("Step 5: Cleaning up FFmpeg process...")
-                await process.wait()
-                if process.returncode != 0:
-                    error_message = await process.stderr.read()
-                    print(f"!!! FFMPEG PROCESS ERROR !!!")
-                    print(f"Return Code: {process.returncode}")
-                    print(f"Error Message: {error_message.decode()}")
-                # Tutup pipa untuk membersihkan sumber daya
-                if process.stdout:
-                    process.stdout.close()
-                if process.stderr:
-                    process.stderr.close()
-
-        print("Step 6: Returning StreamingResponse...")
+        # PERBEDAAN UTAMA: Gunakan header 'inline' untuk streaming
         return StreamingResponse(
-            generate(),
+            iterfile(),
             media_type="video/mp4",
             headers={
-                "Content-Disposition": "inline; filename=\"stream.mp4\"",
-                "Accept-Ranges": "bytes",
-                "Cache-Control": "no-cache"
+                "Content-Disposition": f'inline; filename="{safe_title}.mp4"',
+                "Accept-Ranges": "bytes" # Penting untuk seeker (mundur/maju)
             }
         )
 
     except Exception as e:
-        print(f"!!! FATAL STREAMING ERROR !!!")
+        print(f"!!! STREAMING ERROR !!!")
         print(f"Error: {e}")
-        print(traceback.format_exc())
-        return JSONResponse({"error": f"Failed to start stream: {str(e)}"}, status_code=500)
+        # Jika terjadi error, coba bersihkan direktori
+        asyncio.create_task(cleanup(temp_dir))
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def cleanup(directory: Path):
-    await asyncio.sleep(600)  # Tunggu 10 menit
+    await asyncio.sleep(600) # Tunggu 10 menit
     try:
         for f in directory.iterdir():
             f.unlink()
