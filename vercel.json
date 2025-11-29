@@ -1,20 +1,9 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/download.py",
-      "use": "@vercel/python"
-    }
-  ],
   "routes": [
     {
       "src": "/(.*)",
       "dest": "/api/download.py"
     }
-  ],
-  "functions": {
-    "api/download.py": {
-      "externalNodeModules": ["@vercel/ffmpeg"]
-    }
-  }
+  ]
 }
