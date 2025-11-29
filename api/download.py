@@ -12,7 +12,7 @@ import traceback  # Impor traceback untuk mendapatkan detail error
 app = FastAPI(
     title="YouTube Downloader API",
     description="API untuk mengunduh, streaming (via FFmpeg), dan mencari video dari YouTube.",
-    version="3.1"  # Versi baru untuk tracking
+    version="3.2" # Versi baru
 )
 
 # AMBIL COOKIES DARI ENV & TULIS DENGAN UTF-8
@@ -170,7 +170,7 @@ async def search_videos(q: str = Query(..., description="Kata kunci pencarian"),
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# --- Endpoint Streaming yang Telah Diperbaiki dengan Logging ---
+# --- Endpoint Streaming yang Telah Diperbaiki dengan Path Lengkap ---
 @app.get("/stream")
 async def stream_video(url: str = Query(...), quality: str = Query("1080")):
     """
@@ -179,7 +179,8 @@ async def stream_video(url: str = Query(...), quality: str = Query("1080")):
     print(f"--- STREAM REQUEST RECEIVED ---")
     print(f"URL: {url}, Quality: {quality}")
 
-    ffmpeg_path = "ffmpeg"
+    # PERBAIKAN: Gunakan path lengkap ke FFmpeg di Vercel
+    ffmpeg_path = "/opt/vercel/bin/ffmpeg"
 
     # Coba dapatkan URL streaming
     try:
