@@ -1,14 +1,14 @@
-# main.py
-
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 import yt_dlp
-import httpx # Gunakan httpx untuk async request
 import os
+import uuid
+import asyncio
+from pathlib import Path
 
 app = FastAPI(title="YouTube Video Downloader API")
 
-# Setup cookies dari environment variable (Vercel)
+# Setup cookies dari environment variable
 COOKIE_PATH = None
 cookie_txt = os.getenv("YOUTUBE_COOKIES", "")
 if cookie_txt.strip():
@@ -26,7 +26,7 @@ async def home():
     return {
         "message": "YouTube Video Downloader API aktif",
         "cookies": "loaded" if COOKIE_PATH else "none",
-        "endpoints": ["/info", "/download", "/stream_audio", "/formats"]
+        "endpoints": ["/info", "/download"]
     }
 
 @app.get("/info")
@@ -70,53 +70,6 @@ async def get_video_info(url: str = Query(..., description="URL video YouTube"))
             status_code=500
         )
 
-# ==================== ENDPOINT BARU UNTUK STREAMING AUDIO ====================
-@app.get("/stream_audio")
-async def stream_audio(url: str = Query(..., description="URL video YouTube")):
-    """
-    Endpoint untuk streaming audio dari video YouTube.
-    Berfungsi sebagai proxy untuk menghindari error 403 dari YouTube.
-    """
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'cookiefile': COOKIE_PATH,
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            audio_url = info['url']
-            
-            # Header yang diperlukan untuk meniru permintaan dari browser
-            headers = {
-                'User-Agent': info.get('http_headers', {}).get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'),
-                'Referer': 'https://www.youtube.com/',
-                'Accept': '*/*',
-            }
-
-            async def generator():
-                """Generator untuk streaming data dari YouTube ke client."""
-                async with httpx.AsyncClient() as client:
-                    async with client.get(audio_url, headers=headers, timeout=30.0) as r:
-                        r.raise_for_status()
-                        async for chunk in r.aiter_bytes(chunk_size=8192):
-                            yield chunk
-
-            return StreamingResponse(
-                generator(),
-                media_type="audio/mp4", # M4A container
-                headers={
-                    "Content-Type": "audio/mp4",
-                    "Accept-Ranges": "bytes",
-                    "Cache-Control": "no-cache"
-                }
-            )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error streaming audio: {str(e)}")
-
-# ==================== ENDPOINT LAINNYA (TIDAK DIUBAH) ====================
 @app.get("/download")
 async def download_video(
     url: str = Query(..., description="URL video YouTube"),
@@ -124,19 +77,89 @@ async def download_video(
     format_id: str = Query(None, description="Format ID spesifik (opsional)")
 ):
     """Download video YouTube dengan kualitas tertentu"""
-    # CATATAN: Fitur download mungkin tidak berfungsi dengan baik di Vercel
-    # karena Vercel memiliki batasan waktu eksekusi (max 10-60 detik untuk plan gratis)
-    # dan tidak memiliki sistem file yang persisten.
-    # Untuk fitur download, lebih baik menggunakan server tradisional (VPS).
-    
-    # ... (kode download Anda tetap sama, tidak perlu diubah)
-    # ...
-    return JSONResponse(
-        {"error": "Fitur download tidak didukung di lingkungan serverless Vercel."}, 
-        status_code=501 # Not Implemented
-    )
+    video_id = str(uuid.uuid4())[:8]
+    temp_dir = Path("/tmp") / video_id
+    temp_dir.mkdir(exist_ok=True)
 
+    # Tentukan format berdasarkan parameter
+    if format_id:
+        format_selector = format_id
+    else:
+        format_selector = f'best[height<={quality}][vcodec^=avc]+bestaudio/best[height<={quality}]/best'
 
+    ydl_opts = {
+        'format': format_selector,
+        'merge_output_format': 'mp4',
+        'outtmpl': str(temp_dir / '%(title)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+        'retries': 3,
+        'fragment_retries': 3,
+        'skip_unavailable_fragments': True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        # Cari file video yang sudah di-merge
+        video_file = None
+        for ext in [".mp4", ".webm", ".mkv"]:
+            video_file = next((f for f in temp_dir.iterdir() if f.suffix == ext), None)
+            if video_file:
+                break
+
+        if not video_file:
+            return JSONResponse(
+                {"error": "File video tidak ditemukan setelah download"}, 
+                status_code=500
+            )
+
+        # Bersihkan nama file untuk header
+        safe_title = "".join(
+            c if c.isalnum() or c in " .-_()" else "_" 
+            for c in (info.get("title") or "video")[:100]
+        )
+
+        async def stream_file():
+            """Generator untuk streaming file dengan cleanup otomatis"""
+            try:
+                with open(video_file, "rb") as f:
+                    while chunk := f.read(8192):
+                        yield chunk
+            finally:
+                # Cleanup setelah streaming selesai
+                await cleanup(temp_dir)
+
+        return StreamingResponse(
+            stream_file(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_title}.mp4"',
+                "Content-Length": str(video_file.stat().st_size)
+            }
+        )
+
+    except Exception as e:
+        # Cleanup jika terjadi error
+        await cleanup(temp_dir)
+        return JSONResponse(
+            {"error": f"Gagal download video: {str(e)}"}, 
+            status_code=500
+        )
+
+async def cleanup(directory: Path):
+    """Hapus folder temporary setelah 10 menit"""
+    await asyncio.sleep(600)
+    try:
+        for file in directory.iterdir():
+            file.unlink()
+        directory.rmdir()
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+
+# Tambahkan endpoint untuk list format video (opsional)
 @app.get("/formats")
 async def list_formats(url: str = Query(...)):
     """List semua format video yang tersedia"""
@@ -144,6 +167,7 @@ async def list_formats(url: str = Query(...)):
         'quiet': True,
         'no_warnings': True,
         'cookiefile': COOKIE_PATH,
+        'listformats': True,
     }
     
     try:
