@@ -5,19 +5,46 @@ import os
 import uuid
 import asyncio
 from pathlib import Path
+from datetime import datetime, timezone # Tambahkan import ini
 
 app = FastAPI(title="YouTube Video Downloader API")
 
-# Setup cookies dari environment variable
+# Setup cookies dari environment variable dengan konversi ke format Netscape
 COOKIE_PATH = None
-cookie_txt = os.getenv("YOUTUBE_COOKIES", "")
-if cookie_txt.strip():
+cookie_header_string = os.getenv("YOUTUBE_COOKIES", "")
+
+if cookie_header_string.strip():
     COOKIE_PATH = "/tmp/cookies.txt"
     try:
-        with open(COOKIE_PATH, "w", encoding="utf-8", errors="ignore") as f:
-            f.write(cookie_txt.strip() + "\n")
+        # --- AWAL BLOK KONVERSI COOKIE ---
+        # Gunakan tanggal kadaluarsa yang sangat jauh di masa depan
+        # agar cookie tidak dianggap expired. Contoh: 1 Januari 2035
+        future_timestamp = int(datetime(2035, 1, 1, tzinfo=timezone.utc).timestamp())
+
+        # Header untuk file format Netscape
+        netscape_content = [
+            "# Netscape HTTP Cookie File",
+            "# This is a generated file! Do not edit.\n"
+        ]
+
+        # Pisah setiap cookie (key=value) dan format sesuai standar Netscape
+        for cookie_pair in cookie_header_string.split(';'):
+            if '=' in cookie_pair:
+                key, value = cookie_pair.split('=', 1)
+                # Format: domain	flag	path	secure	expiration	name	value
+                # \t adalah karakter tab
+                netscape_line = f".youtube.com\tTRUE\t/\tTRUE\t{future_timestamp}\t{key.strip()}\t{value.strip()}"
+                netscape_content.append(netscape_line)
+        
+        # Tulis konten yang sudah dikonversi ke file
+        with open(COOKIE_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(netscape_content))
+        
+        print(f"Cookie berhasil ditulis ke {COOKIE_PATH} dalam format Netscape.")
+        # --- AKHIR BLOK KONVERSI COOKIE ---
+
     except Exception as e:
-        print("Gagal menulis cookie:", e)
+        print(f"Gagal menulis atau mengkonversi cookie: {e}")
         COOKIE_PATH = None
 
 @app.get("/")
